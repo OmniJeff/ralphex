@@ -9,6 +9,13 @@
   the change is non-breaking. Absolute paths are supported for placing worktrees
   outside the repo (e.g., `/var/lib/ralphex-worktrees` or a sibling directory
   next to the main checkout).
+- Added a `require_worktree` config option. When enabled, ralphex refuses to run
+  from the main checkout's default branch without `--worktree` and surfaces the
+  missing worktree as a clear error before any agent is invoked. Operators who
+  manage worktrees externally (e.g. `git worktree add ../task-X -b task-X`) get
+  fail-fast feedback instead of an unintended feature-branch commit in the main
+  checkout. Default is `false`; the in-place flow on feature branches is
+  untouched.
 
 ## v1.3.1 - 2026-05-22
 

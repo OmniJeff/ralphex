@@ -64,6 +64,8 @@ type Values struct {
 	WorktreeEnabled            bool
 	WorktreeEnabledSet         bool   // tracks if use_worktree was explicitly set
 	WorktreePath               string // base directory for engine-created worktrees (relative to repo root); default ".ralphex/worktrees"
+	RequireWorktree            bool   // when true, refuse to run from the main repo on the default branch without --worktree
+	RequireWorktreeSet         bool   // tracks if require_worktree was explicitly set
 	VcsCommand                 string // custom VCS command (default: "git")
 	CommitTrailer              string // trailer line to append to all commits (e.g., "Co-authored-by: ...")
 	PlansDir                   string
@@ -372,6 +374,14 @@ func (vl *valuesLoader) parseValuesFromBytes(data []byte) (Values, error) {
 	if key, err := section.GetKey("worktree_path"); err == nil {
 		values.WorktreePath = strings.TrimSpace(key.String())
 	}
+	if key, err := section.GetKey("require_worktree"); err == nil {
+		val, boolErr := key.Bool()
+		if boolErr != nil {
+			return Values{}, fmt.Errorf("invalid require_worktree: %w", boolErr)
+		}
+		values.RequireWorktree = val
+		values.RequireWorktreeSet = true
+	}
 
 	// paths
 	if key, err := section.GetKey("plans_dir"); err == nil {
@@ -593,6 +603,10 @@ func (dst *Values) mergeExtraFrom(src *Values) {
 	}
 	if src.WorktreePath != "" {
 		dst.WorktreePath = src.WorktreePath
+	}
+	if src.RequireWorktreeSet {
+		dst.RequireWorktree = src.RequireWorktree
+		dst.RequireWorktreeSet = true
 	}
 	if src.PlansDir != "" {
 		dst.PlansDir = src.PlansDir
