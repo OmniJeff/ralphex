@@ -434,19 +434,151 @@ func TestRunner_TaskPhase_ContextCanceled(t *testing.T) {
 	assert.ErrorIs(t, err, context.Canceled)
 }
 
+// logContains reports whether any Print call rendered to a line containing substr.
+// review end-reason markers are logged with a "%s%s" format, so the literal text
+// lives in Args, not Format — render before matching.
+func logContains(log *mocks.LoggerMock, substr string) bool {
+	for _, call := range log.PrintCalls() {
+		if strings.Contains(fmt.Sprintf(call.Format, call.Args...), substr) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestRunner_ClaudeReview_FailedSignal asserts the iterate-on-findings behavior of
+// task-301.25: a FAILED first review pass no longer aborts the run — it flows into
+// the critical/major review loop, which here converges on the next pass.
 func TestRunner_ClaudeReview_FailedSignal(t *testing.T) {
 	log := newMockLogger("progress.txt")
 	claude := newMockExecutor([]executor.Result{
-		{Output: "error", Signal: status.Failed},
+		{Output: "found issues, could not fix all", Signal: status.Failed}, // first review pass
+		{Output: "review done", Signal: status.ReviewDone},                 // review loop: clean
 	})
 	codex := newMockExecutor(nil)
 
-	cfg := processor.Config{Mode: processor.ModeReview, MaxIterations: 50, AppConfig: testAppConfig(t)}
+	cfg := processor.Config{Mode: processor.ModeReview, MaxIterations: 50, IterationDelayMs: 1, CodexEnabled: false, AppConfig: testAppConfig(t)}
 	r := processor.NewWithExecutors(cfg, log, processor.Executors{Task: claude, External: codex}, &status.PhaseHolder{})
 	err := r.Run(t.Context())
 
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "FAILED signal")
+	require.NoError(t, err, "a single failing review pass must not end the run")
+	assert.Len(t, claude.RunCalls(), 2, "first review pass + one review-loop iteration that converged")
+	assert.True(t, logContains(log, "continuing into the review loop"),
+		"first-pass FAILED should flow into the review loop instead of aborting")
+}
+
+// TestRunner_ReviewLoop_FailedThenCommit_IteratesToClean covers AC#1/#2: a review
+// pass reporting findings it could not fully resolve (FAILED) but making committed
+// progress is followed by another fix-and-review cycle, which then converges.
+func TestRunner_ReviewLoop_FailedThenCommit_IteratesToClean(t *testing.T) {
+	log := newMockLogger("progress.txt")
+
+	claude := newMockExecutor([]executor.Result{
+		{Output: "found issues, could not fix all", Signal: status.Failed}, // first review pass → flows into loop
+		{Output: "fixed some, more remain", Signal: status.Failed},         // loop iter 1: FAILED + commit
+		{Output: "review done", Signal: status.ReviewDone},                 // loop iter 2: clean
+	})
+	codex := newMockExecutor(nil)
+
+	// loop iter 1 makes two HeadHash calls (before, after) that differ → committed
+	// progress. loop iter 2 makes one HeadHash call (before) then REVIEW_DONE returns.
+	hashes := []string{"head-1", "head-2", "head-2"}
+	hashIdx := 0
+	gitMock := &mocks.GitCheckerMock{
+		HeadHashFunc: func() (string, error) {
+			require.Less(t, hashIdx, len(hashes), "unexpected extra HeadHash call #%d", hashIdx)
+			h := hashes[hashIdx]
+			hashIdx++
+			return h, nil
+		},
+		DiffFingerprintFunc: func() (string, error) { return "constant-diff", nil },
+	}
+
+	cfg := processor.Config{Mode: processor.ModeReview, MaxIterations: 50, IterationDelayMs: 1, CodexEnabled: false, AppConfig: testAppConfig(t)}
+	r := processor.NewWithExecutors(cfg, log, processor.Executors{Task: claude, External: codex}, &status.PhaseHolder{})
+	r.SetGitChecker(gitMock)
+	err := r.Run(t.Context())
+
+	require.NoError(t, err, "a FAILED review that makes progress must not abort the run")
+	assert.Len(t, claude.RunCalls(), 3)
+	assert.True(t, logContains(log, "running another review iteration"),
+		"should keep iterating after a FAILED-with-progress pass")
+	assert.True(t, logContains(log, "review complete - no more findings"), "should converge cleanly")
+	assert.False(t, logContains(log, "review ended with unresolved findings"),
+		"must not record an unresolved end-reason when it converged")
+}
+
+// TestRunner_ReviewLoop_FailedNoCommit_EndsWithStalemate covers AC#3/#4 (stalemate):
+// when a FAILED review makes no committed progress, the run ends — cleanly, so it
+// proceeds to the gates — recording the stalemate end-reason rather than aborting.
+func TestRunner_ReviewLoop_FailedNoCommit_EndsWithStalemate(t *testing.T) {
+	log := newMockLogger("progress.txt")
+
+	claude := newMockExecutor([]executor.Result{
+		{Output: "found issues, cannot fix", Signal: status.Failed}, // first review pass → flows into loop
+		{Output: "still cannot fix", Signal: status.Failed},         // loop iter 1: FAILED + no commit
+	})
+	codex := newMockExecutor(nil)
+
+	// HEAD never moves → no committed progress → stalemate on the first loop pass.
+	gitMock := &mocks.GitCheckerMock{
+		HeadHashFunc:        func() (string, error) { return "head-unchanged", nil },
+		DiffFingerprintFunc: func() (string, error) { return "constant-diff", nil },
+	}
+
+	cfg := processor.Config{Mode: processor.ModeReview, MaxIterations: 50, IterationDelayMs: 1, CodexEnabled: false, AppConfig: testAppConfig(t)}
+	r := processor.NewWithExecutors(cfg, log, processor.Executors{Task: claude, External: codex}, &status.PhaseHolder{})
+	r.SetGitChecker(gitMock)
+	err := r.Run(t.Context())
+
+	require.NoError(t, err, "a stalemated review must end the run cleanly, not abort")
+	assert.Len(t, claude.RunCalls(), 2)
+	assert.True(t, logContains(log, "review ended with unresolved findings: no progress (stalemate)"),
+		"should record the stalemate end-reason marker for the operator report")
+}
+
+// TestRunner_ReviewLoop_FailedRepeatedWithProgress_EndsWithBudgetExhausted covers
+// AC#3/#4 (budget): when every FAILED review pass makes committed progress but the
+// work never converges, the loop iterates until its budget is exhausted, then ends
+// cleanly recording the budget end-reason.
+func TestRunner_ReviewLoop_FailedRepeatedWithProgress_EndsWithBudgetExhausted(t *testing.T) {
+	log := newMockLogger("progress.txt")
+
+	// MaxIterations 10 → maxReviewIterations = max(3, 10/10) = 3.
+	claude := newMockExecutor([]executor.Result{
+		{Output: "found issues", Signal: status.Failed}, // first review pass → flows into loop
+		{Output: "fixed some", Signal: status.Failed},   // loop iter 1: FAILED + commit
+		{Output: "fixed more", Signal: status.Failed},   // loop iter 2: FAILED + commit
+		{Output: "fixed more", Signal: status.Failed},   // loop iter 3: FAILED + commit (budget end)
+	})
+	codex := newMockExecutor(nil)
+
+	// each loop iteration makes a distinct before/after pair → committed progress.
+	hashes := []string{
+		"head-1", "head-2", // iter1 before, after
+		"head-2", "head-3", // iter2 before, after
+		"head-3", "head-4", // iter3 before, after
+	}
+	hashIdx := 0
+	gitMock := &mocks.GitCheckerMock{
+		HeadHashFunc: func() (string, error) {
+			require.Less(t, hashIdx, len(hashes), "unexpected extra HeadHash call #%d", hashIdx)
+			h := hashes[hashIdx]
+			hashIdx++
+			return h, nil
+		},
+		DiffFingerprintFunc: func() (string, error) { return "constant-diff", nil },
+	}
+
+	cfg := processor.Config{Mode: processor.ModeReview, MaxIterations: 10, IterationDelayMs: 1, CodexEnabled: false, AppConfig: testAppConfig(t)}
+	r := processor.NewWithExecutors(cfg, log, processor.Executors{Task: claude, External: codex}, &status.PhaseHolder{})
+	r.SetGitChecker(gitMock)
+	err := r.Run(t.Context())
+
+	require.NoError(t, err, "exhausting the review budget must end the run cleanly, not abort")
+	assert.Len(t, claude.RunCalls(), 4, "first review pass + 3 review-loop iterations")
+	assert.True(t, logContains(log, "review ended with unresolved findings: iteration budget exhausted"),
+		"should record the budget-exhausted end-reason marker for the operator report")
 }
 
 func TestRunner_CodexPhase_Error(t *testing.T) {

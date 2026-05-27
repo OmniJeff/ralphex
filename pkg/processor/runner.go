@@ -32,6 +32,19 @@ const (
 	maxCodexSummaryLen     = 5000 // max chars for codex output summary
 )
 
+// review end-reason markers. when the critical/major review loop ends without
+// converging, it logs reviewUnresolvedPrefix followed by one of the reason
+// strings below. the prefix is a stable, greppable token so an operator-side
+// report can record which reason applied when a run ends with unresolved
+// findings (the iterate-on-findings behavior of task-301.25). out-of-scope
+// findings are not detected here — they are recorded by the operator/acceptance
+// gate, which is why only the budget and stalemate reasons live in the loop.
+const (
+	reviewUnresolvedPrefix   = "review ended with unresolved findings: "
+	reviewEndReasonBudget    = "iteration budget exhausted"
+	reviewEndReasonStalemate = "no progress (stalemate)"
+)
+
 // Mode represents the execution mode.
 type Mode string
 
@@ -688,7 +701,12 @@ func (r *Runner) runReview(ctx context.Context, prompt, phaseLabel string) error
 	}
 
 	if result.Signal == SignalFailed {
-		return errors.New("review failed (FAILED signal received)")
+		// a FAILED first review reports findings it could not fully resolve in one
+		// pass. rather than aborting the run here, fall through into the critical/major
+		// review loop, which iterates fix-and-review to convergence (or to a recorded
+		// end-reason). a single failing review pass is not meant to end the run.
+		r.log.Print("%s reported unresolved findings, continuing into the review loop to resolve them", phaseLabel)
+		return nil
 	}
 
 	// session/idle timeout cleared result.Error and result.Signal inside runWithSessionTimeout.
@@ -723,6 +741,12 @@ func (r *Runner) runReviewLoop(ctx context.Context, promptPrefix ...string) erro
 	}
 
 	execName := r.executorName()
+	// unresolvedFindings becomes true once a review pass reports findings it could
+	// not resolve (FAILED) yet made committed progress, so we kept iterating. it is
+	// sticky: if the loop later exhausts its budget without converging, the run is
+	// recorded as ending with unresolved findings (budget reason) rather than the
+	// generic non-convergence message.
+	unresolvedFindings := false
 	for i := 1; i <= maxReviewIterations; i++ {
 		select {
 		case <-ctx.Done():
@@ -745,7 +769,25 @@ func (r *Runner) runReviewLoop(ctx context.Context, promptPrefix ...string) erro
 		}
 
 		if result.Signal == SignalFailed {
-			return errors.New("review failed (FAILED signal received)")
+			// a FAILED review reports findings it could not fully resolve this pass.
+			// instead of aborting the run, keep iterating so later passes can resolve
+			// them. ending early only on the conditions task-301.25 calls out: no
+			// progress between iterations (stalemate) or budget exhaustion below.
+			// the no-commit check mirrors the convergence detection further down — if
+			// HEAD did not move this iteration, the reviewer made no committed progress.
+			if headBefore != "" {
+				if headAfter := r.headHash(); headAfter == headBefore {
+					r.log.Print("%s%s", reviewUnresolvedPrefix, reviewEndReasonStalemate)
+					return nil
+				}
+			}
+			// HEAD moved → partial progress was committed → consume budget and re-review.
+			unresolvedFindings = true
+			r.log.Print("%s review reported unresolved findings but made progress, running another review iteration...", execName)
+			if err := r.sleepWithContext(ctx, r.iterationDelay); err != nil {
+				return fmt.Errorf("interrupted: %w", err)
+			}
+			continue
 		}
 
 		if isReviewDone(result.Signal) {
@@ -774,7 +816,14 @@ func (r *Runner) runReviewLoop(ctx context.Context, promptPrefix ...string) erro
 		}
 	}
 
-	r.log.Print("max %s review iterations reached, continuing...", execName)
+	// budget exhausted. if a prior pass surfaced findings it could not resolve, record
+	// the run as ending with unresolved findings (budget reason). otherwise keep the
+	// generic message — the reviewer kept committing fixes but did not converge in time.
+	if unresolvedFindings {
+		r.log.Print("%s%s", reviewUnresolvedPrefix, reviewEndReasonBudget)
+	} else {
+		r.log.Print("max %s review iterations reached, continuing...", execName)
+	}
 	return nil
 }
 
