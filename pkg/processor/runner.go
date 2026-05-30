@@ -3,6 +3,7 @@ package processor
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -44,6 +45,27 @@ const (
 	reviewEndReasonBudget    = "iteration budget exhausted"
 	reviewEndReasonStalemate = "no progress (stalemate)"
 )
+
+// tokenUsagePrefix marks the single end-of-run line that carries a run's
+// measured token usage. Like reviewUnresolvedPrefix it is a stable, greppable
+// token: the operator-side launch (the /ralph skill) reads the last such line
+// from the operator log and persists its JSON into run-state.json, where the
+// end-of-run report renders it. The line is emitted only when usage was actually
+// measured, so a run with no measurement leaves no line and the report reads
+// "unavailable" rather than a misleading measured zero.
+const tokenUsagePrefix = "RALPH_TOKEN_USAGE "
+
+// tokenUsage accumulates the model runner's per-result usage accounting across a
+// run. The JSON field names match the claude CLI result event's `usage` object
+// and top-level `total_cost_usd`, so the emitted line is consumed verbatim by
+// the launch skill and the report reader.
+type tokenUsage struct {
+	InputTokens              int64   `json:"input_tokens"`
+	CacheCreationInputTokens int64   `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int64   `json:"cache_read_input_tokens"`
+	OutputTokens             int64   `json:"output_tokens"`
+	TotalCostUSD             float64 `json:"total_cost_usd"`
+}
 
 // Mode represents the execution mode.
 type Mode string
@@ -149,6 +171,8 @@ type Runner struct {
 	lastSessionTimedOut    bool                            // set by runWithSessionTimeout, checked by review loops
 	taskPhaseOverride      func(ctx context.Context) error // test seam: override runTaskPhase result (nil = normal execution)
 	codexFrontmatterWarned map[string]bool                 // tracks per-agent codex frontmatter-discard warnings (one log per agent name)
+	usage                  tokenUsage                      // token/cost accounting summed across every executor call this run
+	usageMeasured          bool                            // true once any result carrying a usage event was accrued (AC#2: measured vs unavailable)
 }
 
 // New creates a new Runner with the given configuration and shared phase holder.
@@ -428,8 +452,16 @@ func (r *Runner) SetPauseHandler(fn func(ctx context.Context) bool) {
 	r.pauseHandler = fn
 }
 
-// Run executes the main loop based on configured mode.
+// Run executes the main loop based on configured mode, then emits the run's
+// accumulated token usage as a single end-of-run line.
 func (r *Runner) Run(ctx context.Context) error {
+	err := r.dispatch(ctx)
+	r.emitTokenUsage()
+	return err
+}
+
+// dispatch routes to the per-mode pipeline.
+func (r *Runner) dispatch(ctx context.Context) error {
 	switch r.cfg.Mode {
 	case ModeFull:
 		return r.runFull(ctx)
@@ -444,6 +476,40 @@ func (r *Runner) Run(ctx context.Context) error {
 	default:
 		return fmt.Errorf("unknown mode: %s", r.cfg.Mode)
 	}
+}
+
+// accrueUsage folds one executor result's token-usage accounting into the run
+// totals. It is called once per executor invocation at the single chokepoint in
+// runWithSessionTimeout, so every phase and every limit/timeout retry
+// contributes. A result that carried no usage event (UsageMeasured false — a
+// codex/custom result, or a claude phase that produced no terminal result event)
+// is skipped, so the run stays unmeasured until at least one measured result
+// arrives.
+func (r *Runner) accrueUsage(res executor.Result) {
+	if !res.UsageMeasured {
+		return
+	}
+	r.usageMeasured = true
+	r.usage.InputTokens += res.InputTokens
+	r.usage.CacheCreationInputTokens += res.CacheCreationInputTokens
+	r.usage.CacheReadInputTokens += res.CacheReadInputTokens
+	r.usage.OutputTokens += res.OutputTokens
+	r.usage.TotalCostUSD += res.CostUSD
+}
+
+// emitTokenUsage prints the run's accumulated token usage as one greppable line
+// at run end. It emits only when at least one measured result was seen, so an
+// unmeasured run (e.g. codex-only, or an engine build that never reports usage)
+// leaves no line and the report reads "unavailable" rather than a measured zero.
+func (r *Runner) emitTokenUsage() {
+	if !r.usageMeasured {
+		return
+	}
+	data, err := json.Marshal(r.usage)
+	if err != nil {
+		return // best-effort: never fail a run over a usage-summary marshal error
+	}
+	r.log.Print("%s%s", tokenUsagePrefix, string(data))
 }
 
 // runFull executes the complete pipeline: tasks → review → codex → review.
@@ -1490,6 +1556,7 @@ func (r *Runner) runWithSessionTimeout(ctx context.Context, run func(context.Con
 
 	if !useTimeout {
 		result := run(ctx, prompt)
+		r.accrueUsage(result)
 		r.handleIdleTimeout(result, toolName)
 		return result
 	}
@@ -1498,6 +1565,7 @@ func (r *Runner) runWithSessionTimeout(ctx context.Context, run func(context.Con
 	defer cancel()
 
 	result := run(childCtx, prompt)
+	r.accrueUsage(result)
 
 	// check if this was a session timeout: child context expired but parent is still alive.
 	// clear the error so callers (task loop, review loop) treat it as a non-completing iteration

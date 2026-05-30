@@ -2,6 +2,7 @@ package processor_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -312,6 +313,84 @@ func TestRunner_RunTasksOnly_Success(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, codex.RunCalls(), "codex should not be called in tasks-only mode")
 	assert.Len(t, claude.RunCalls(), 1)
+}
+
+// captureUsageLines runs a tasks-only loop over the given results and returns
+// the RALPH_TOKEN_USAGE lines the logger emitted. Tasks-only consumes exactly
+// one executor result per iteration until a Completed signal, so usage accrual
+// is deterministic.
+func captureUsageLines(t *testing.T, results []executor.Result) []string {
+	t.Helper()
+	tmpDir := t.TempDir()
+	planFile := filepath.Join(tmpDir, "plan.md")
+	require.NoError(t, os.WriteFile(planFile, []byte("# Plan\n### Task 1: first\n- [x] done"), 0o600))
+
+	var printed []string
+	log := newMockLogger("progress.txt")
+	log.PrintFunc = func(format string, args ...any) {
+		printed = append(printed, fmt.Sprintf(format, args...))
+	}
+
+	claude := newMockExecutor(results)
+	cfg := processor.Config{Mode: processor.ModeTasksOnly, PlanFile: planFile, MaxIterations: 50, IterationDelayMs: 1, AppConfig: testAppConfig(t)}
+	r := processor.NewWithExecutors(cfg, log, processor.Executors{Task: claude}, &status.PhaseHolder{})
+	require.NoError(t, r.Run(t.Context()))
+
+	var usageLines []string
+	for _, line := range printed {
+		if strings.HasPrefix(line, "RALPH_TOKEN_USAGE ") {
+			usageLines = append(usageLines, line)
+		}
+	}
+	return usageLines
+}
+
+func TestRunner_Run_EmitsTokenUsageAtRunEnd(t *testing.T) {
+	// one measured claude result completes the task phase; the run emits exactly
+	// one end-of-run usage line carrying that result's accounting (AC#1, AC#3).
+	usageLines := captureUsageLines(t, []executor.Result{
+		{Output: "task done", Signal: status.Completed, UsageMeasured: true,
+			InputTokens: 2060, CacheCreationInputTokens: 12, CacheReadInputTokens: 34,
+			OutputTokens: 342, CostUSD: 0.0117},
+	})
+	require.Len(t, usageLines, 1, "exactly one end-of-run token-usage line")
+
+	var got map[string]any
+	require.NoError(t, json.Unmarshal([]byte(strings.TrimPrefix(usageLines[0], "RALPH_TOKEN_USAGE ")), &got))
+	// JSON numbers decode to float64; compare with a tight delta (testifylint).
+	assert.InDelta(t, 2060, got["input_tokens"], 1e-9)
+	assert.InDelta(t, 12, got["cache_creation_input_tokens"], 1e-9)
+	assert.InDelta(t, 34, got["cache_read_input_tokens"], 1e-9)
+	assert.InDelta(t, 342, got["output_tokens"], 1e-9)
+	assert.InDelta(t, 0.0117, got["total_cost_usd"], 1e-9)
+}
+
+func TestRunner_Run_AccumulatesTokenUsageAcrossIterations(t *testing.T) {
+	// three task iterations (two without a completion signal, then Completed)
+	// each report usage; the single end-of-run line sums them (AC#3).
+	usageLines := captureUsageLines(t, []executor.Result{
+		{Output: "working", UsageMeasured: true, InputTokens: 100, OutputTokens: 10, CostUSD: 0.01},
+		{Output: "working", UsageMeasured: true, InputTokens: 200, CacheReadInputTokens: 7, OutputTokens: 20, CostUSD: 0.02},
+		{Output: "task done", Signal: status.Completed, UsageMeasured: true, InputTokens: 50, OutputTokens: 5, CostUSD: 0.005},
+	})
+	require.Len(t, usageLines, 1)
+
+	var got map[string]any
+	require.NoError(t, json.Unmarshal([]byte(strings.TrimPrefix(usageLines[0], "RALPH_TOKEN_USAGE ")), &got))
+	assert.InDelta(t, 350, got["input_tokens"], 1e-9)
+	assert.InDelta(t, 7, got["cache_read_input_tokens"], 1e-9)
+	assert.InDelta(t, 35, got["output_tokens"], 1e-9)
+	assert.InDelta(t, 0.035, got["total_cost_usd"], 1e-9)
+}
+
+func TestRunner_Run_NoTokenUsageLineWhenUnmeasured(t *testing.T) {
+	// a result with no usage event (UsageMeasured false — e.g. a codex/custom
+	// run, or an engine build that never reports usage) leaves no line, so the
+	// report reads "unavailable" rather than a fabricated measured zero (AC#2).
+	usageLines := captureUsageLines(t, []executor.Result{
+		{Output: "task done", Signal: status.Completed},
+	})
+	assert.Empty(t, usageLines, "unmeasured run emits no token-usage line")
 }
 
 func TestRunner_RunTasksOnly_NoPlanFile(t *testing.T) {

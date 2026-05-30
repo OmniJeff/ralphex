@@ -24,6 +24,34 @@ type Result struct {
 	Signal       string // detected signal (COMPLETED, FAILED, etc.) or empty
 	Error        error  // execution error if any
 	IdleTimedOut bool   // true when idle timeout fired (derived context canceled, parent alive)
+
+	// token-usage accounting, copied from the stream's terminal "result" event.
+	// UsageMeasured is true when a result event carrying a usage object was seen,
+	// so a caller can tell a measured zero apart from "no measurement" — a stream
+	// with no result event (an error or interrupted run) leaves these zero and
+	// UsageMeasured false.
+	InputTokens              int64
+	CacheCreationInputTokens int64
+	CacheReadInputTokens     int64
+	OutputTokens             int64
+	CostUSD                  float64
+	UsageMeasured            bool
+}
+
+// carryUsage copies the token-usage accounting fields from src onto r and
+// returns r. Run builds derived Results on its limit/error/cancel short-circuit
+// paths; using this keeps any usage parseStream already measured from being
+// dropped — a session can reach normal completion (emitting a usage-carrying
+// result event) and still have its recent output match a configured error
+// pattern.
+func (r Result) carryUsage(src Result) Result {
+	r.InputTokens = src.InputTokens
+	r.CacheCreationInputTokens = src.CacheCreationInputTokens
+	r.CacheReadInputTokens = src.CacheReadInputTokens
+	r.OutputTokens = src.OutputTokens
+	r.CostUSD = src.CostUSD
+	r.UsageMeasured = src.UsageMeasured
+	return r
 }
 
 const recentBlockCount = 10 // number of recent text blocks to keep for pattern matching
@@ -227,6 +255,16 @@ type streamEvent struct {
 		Text string `json:"text"`
 	} `json:"delta"`
 	Result json.RawMessage `json:"result"` // can be string or object with "output" field
+	// usage and cost ride on the terminal "result" event under --output-format
+	// stream-json --verbose. Other event types carry no such keys, so json
+	// leaves these zero for them.
+	Usage struct {
+		InputTokens              int64 `json:"input_tokens"`
+		CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
+		CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
+		OutputTokens             int64 `json:"output_tokens"`
+	} `json:"usage"`
+	CostUSD float64 `json:"total_cost_usd"`
 }
 
 // ClaudeExecutor runs claude CLI commands with streaming JSON parsing.
@@ -325,7 +363,7 @@ func (e *ClaudeExecutor) Run(ctx context.Context, prompt string) Result {
 				Output: result.Output, RecentText: result.RecentText,
 				Signal: result.Signal,
 				Error:  &LimitPatternError{Pattern: pattern, HelpCmd: "claude /usage"},
-			}
+			}.carryUsage(result)
 		}
 		// check for error patterns in output
 		if pattern := matchPattern(result.RecentText, e.ErrorPatterns); pattern != "" {
@@ -333,7 +371,7 @@ func (e *ClaudeExecutor) Run(ctx context.Context, prompt string) Result {
 				Output: result.Output, RecentText: result.RecentText,
 				Signal: result.Signal,
 				Error:  &PatternMatchError{Pattern: pattern, HelpCmd: "claude /usage"},
-			}
+			}.carryUsage(result)
 		}
 		result.Error = nil
 		result.IdleTimedOut = true
@@ -343,7 +381,7 @@ func (e *ClaudeExecutor) Run(ctx context.Context, prompt string) Result {
 	if waitErr != nil {
 		// check if it was context cancellation
 		if ctx.Err() != nil {
-			return Result{Output: result.Output, RecentText: result.RecentText, Signal: result.Signal, Error: ctx.Err()}
+			return Result{Output: result.Output, RecentText: result.RecentText, Signal: result.Signal, Error: ctx.Err()}.carryUsage(result)
 		}
 		if result.Output == "" {
 			return Result{Error: fmt.Errorf("claude exited with error: %w", waitErr)}
@@ -361,7 +399,7 @@ func (e *ClaudeExecutor) Run(ctx context.Context, prompt string) Result {
 			Output: result.Output, RecentText: result.RecentText,
 			Signal: result.Signal,
 			Error:  &LimitPatternError{Pattern: pattern, HelpCmd: "claude /usage"},
-		}
+		}.carryUsage(result)
 	}
 
 	// check for error patterns in output
@@ -370,7 +408,7 @@ func (e *ClaudeExecutor) Run(ctx context.Context, prompt string) Result {
 			Output: result.Output, RecentText: result.RecentText,
 			Signal: result.Signal,
 			Error:  &PatternMatchError{Pattern: pattern, HelpCmd: "claude /usage"},
-		}
+		}.carryUsage(result)
 	}
 
 	return result
@@ -385,6 +423,12 @@ func (e *ClaudeExecutor) parseStream(ctx context.Context, r io.Reader, idleTouch
 	var signal string
 	var recentBlocks [recentBlockCount]string
 	var blockIdx int
+
+	// token-usage accounting accumulated from terminal "result" event(s). A
+	// well-formed stream carries exactly one; summing is defensive.
+	var usageIn, usageCacheCreate, usageCacheRead, usageOut int64
+	var usageCost float64
+	var usageMeasured bool
 
 	err := readLines(ctx, r, func(line string) {
 		idleTouch() // reset idle timer on every line of pipe activity
@@ -406,6 +450,17 @@ func (e *ClaudeExecutor) parseStream(ctx context.Context, r io.Reader, idleTouch
 				e.OutputHandler(line + "\n")
 			}
 			return
+		}
+
+		// capture token usage from the terminal result event. extractText
+		// stays text-only; this is the one place that reads usage/cost.
+		if event.Type == "result" {
+			usageIn += event.Usage.InputTokens
+			usageCacheCreate += event.Usage.CacheCreationInputTokens
+			usageCacheRead += event.Usage.CacheReadInputTokens
+			usageOut += event.Usage.OutputTokens
+			usageCost += event.CostUSD
+			usageMeasured = true
 		}
 
 		text := e.extractText(&event)
@@ -438,12 +493,21 @@ func (e *ClaudeExecutor) parseStream(ctx context.Context, r io.Reader, idleTouch
 		}
 	}
 
-	if err != nil {
-		return Result{Output: output.String(), RecentText: recent.String(), Signal: signal,
-			Error: fmt.Errorf("stream read: %w", err)}
+	res := Result{
+		Output:                   output.String(),
+		RecentText:               recent.String(),
+		Signal:                   signal,
+		InputTokens:              usageIn,
+		CacheCreationInputTokens: usageCacheCreate,
+		CacheReadInputTokens:     usageCacheRead,
+		OutputTokens:             usageOut,
+		CostUSD:                  usageCost,
+		UsageMeasured:            usageMeasured,
 	}
-
-	return Result{Output: output.String(), RecentText: recent.String(), Signal: signal}
+	if err != nil {
+		res.Error = fmt.Errorf("stream read: %w", err)
+	}
+	return res
 }
 
 // extractText extracts text content from various event types.

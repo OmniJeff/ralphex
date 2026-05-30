@@ -230,6 +230,43 @@ func TestClaudeExecutor_parseStream(t *testing.T) {
 	}
 }
 
+func TestClaudeExecutor_parseStream_usage(t *testing.T) {
+	t.Run("result event carries usage and cost", func(t *testing.T) {
+		input := `{"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}
+{"type":"result","subtype":"success","usage":{"input_tokens":2060,"cache_creation_input_tokens":12,"cache_read_input_tokens":34,"output_tokens":342,"service_tier":"standard"},"total_cost_usd":0.0117,"result":"final output"}`
+		e := &ClaudeExecutor{}
+		result := e.parseStream(context.Background(), strings.NewReader(input), func() {})
+
+		assert.True(t, result.UsageMeasured, "a result event with a usage object marks the run measured")
+		assert.Equal(t, int64(2060), result.InputTokens)
+		assert.Equal(t, int64(12), result.CacheCreationInputTokens)
+		assert.Equal(t, int64(34), result.CacheReadInputTokens)
+		assert.Equal(t, int64(342), result.OutputTokens)
+		assert.InDelta(t, 0.0117, result.CostUSD, 1e-9)
+	})
+
+	t.Run("no result event leaves usage unmeasured", func(t *testing.T) {
+		input := `{"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}`
+		e := &ClaudeExecutor{}
+		result := e.parseStream(context.Background(), strings.NewReader(input), func() {})
+
+		assert.False(t, result.UsageMeasured, "a stream with no result event is not a measured zero")
+		assert.Zero(t, result.InputTokens)
+		assert.Zero(t, result.OutputTokens)
+		assert.Zero(t, result.CostUSD)
+	})
+
+	t.Run("measured zero is distinct from unmeasured", func(t *testing.T) {
+		input := `{"type":"result","subtype":"success","usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0},"total_cost_usd":0,"result":"done"}`
+		e := &ClaudeExecutor{}
+		result := e.parseStream(context.Background(), strings.NewReader(input), func() {})
+
+		assert.True(t, result.UsageMeasured, "a result event with all-zero usage is still a measurement")
+		assert.Zero(t, result.InputTokens)
+		assert.Zero(t, result.CostUSD)
+	})
+}
+
 func TestClaudeExecutor_parseStream_withHandler(t *testing.T) {
 	input := `{"type":"content_block_delta","delta":{"type":"text_delta","text":"chunk1"}}
 {"type":"content_block_delta","delta":{"type":"text_delta","text":"chunk2"}}`
@@ -823,6 +860,30 @@ func TestClaudeExecutor_Run_WaitError_WithOutputAndErrorPattern(t *testing.T) {
 	assert.Equal(t, "cannot be launched inside another Claude Code session", patternErr.Pattern)
 	assert.Contains(t, result.Output, "cannot be launched inside another Claude Code session")
 	assert.Empty(t, result.Signal)
+}
+
+func TestClaudeExecutor_Run_ErrorPattern_PreservesUsage(t *testing.T) {
+	// a session can reach normal completion (emitting a usage-carrying result
+	// event) and still match a configured error pattern in its recent output.
+	// the error-path Result must carry the measured usage rather than drop it,
+	// or the run total under-counts.
+	stream := `{"type":"content_block_delta","delta":{"type":"text_delta","text":"done, but rate limit warning appeared"}}
+{"type":"result","subtype":"success","usage":{"input_tokens":500,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":50},"total_cost_usd":0.02,"result":"final"}`
+	mock := &mocks.CommandRunnerMock{
+		RunFunc: func(_ context.Context, _ string, _ ...string) (io.Reader, func() error, error) {
+			return strings.NewReader(stream), func() error { return nil }, nil
+		},
+	}
+	e := &ClaudeExecutor{cmdRunner: mock, ErrorPatterns: []string{"rate limit warning"}}
+
+	result := e.Run(context.Background(), "test prompt")
+
+	var patternErr *PatternMatchError
+	require.ErrorAs(t, result.Error, &patternErr)
+	assert.True(t, result.UsageMeasured, "usage measured before the error pattern matched must survive the error-path Result")
+	assert.Equal(t, int64(500), result.InputTokens)
+	assert.Equal(t, int64(50), result.OutputTokens)
+	assert.InDelta(t, 0.02, result.CostUSD, 1e-9)
 }
 
 func TestClaudeExecutor_Run_WaitError_WithSignalAndErrorPattern(t *testing.T) {
